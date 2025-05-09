@@ -7,7 +7,6 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# Configure Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash-preview-04-17")
 
@@ -19,42 +18,43 @@ def index():
 def summarize():
     try:
         data = request.json
-        feed_url = data.get("feedUrl")
+        feed_urls = data.get("feedUrls", [])
 
-        if not feed_url:
-            return jsonify({"error": "Missing feedUrl"}), 400
+        if not feed_urls or not isinstance(feed_urls, list):
+            return jsonify({"error": "feedUrls must be a list of URLs"}), 400
 
-        print(f"⏳ Fetching RSS feed from: {feed_url}")
-        feed = feedparser.parse(feed_url)
-        if not feed.entries:
-            print("⚠️ No articles found in feed")
-            return jsonify({"error": "No articles found in feed"}), 404
+        result = []
+        for url in feed_urls[:10]:
+            print(f"⏳ Parsing feed: {url}")
+            feed = feedparser.parse(url)
+            if not feed.entries:
+                continue
 
-        summaries = []
-        for entry in feed.entries[:5]:
-            title = entry.get("title", "")
-            content = entry.get("summary", "") or entry.get("description", "")
-            url = entry.get("link", "")
+            feed_summaries = []
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "")
+                content = entry.get("summary", "") or entry.get("description", "")
+                link = entry.get("link", "")
 
-            print(f"📝 Summarizing: {title}")
+                try:
+                    prompt = f"Summarize the following news article clearly and concisely:\n\nTitle: {title}\n\n{content}"
+                    response = model.generate_content(prompt)
+                    summary = response.text.strip()
+                except Exception as e:
+                    summary = f"[Gemini error: {str(e)}]"
 
-            try:
-                prompt = f"Summarize the following news article clearly and concisely:\n\nTitle: {title}\n\n{content}"
-                response = model.generate_content(prompt)
-                summaries.append({
+                feed_summaries.append({
                     "title": title,
-                    "summary": response.text.strip(),
-                    "link": url
-                })
-            except Exception as e:
-                print(f"❌ Gemini API error: {e}")
-                summaries.append({
-                    "title": title,
-                    "summary": f"[Gemini error: {str(e)}]",
-                    "link": url
+                    "summary": summary,
+                    "link": link
                 })
 
-        return jsonify({"summaries": summaries})
+            result.append({
+                "source": feed.feed.get("title", url),
+                "summaries": feed_summaries
+            })
+
+        return jsonify({ "feeds": result })
     except Exception as e:
         print(f"❌ Uncaught error in summarize(): {e}")
         return jsonify({"error": str(e)}), 500
