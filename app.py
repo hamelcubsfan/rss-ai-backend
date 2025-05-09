@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import google.generativeai as genai
 import os
+import feedparser
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -16,12 +17,19 @@ def index():
 @app.route("/summarize", methods=["POST"])
 def summarize():
     data = request.json
-    entries = data.get("entries", [])
+    feed_url = data.get("feedUrl")
+
+    if not feed_url:
+        return jsonify({"error": "Missing feedUrl"}), 400
+
+    feed = feedparser.parse(feed_url)
+    if not feed.entries:
+        return jsonify({"error": "No articles found in feed"}), 404
 
     summaries = []
-    for entry in entries:
+    for entry in feed.entries[:5]:
         title = entry.get("title", "")
-        content = entry.get("content", "")
+        content = entry.get("summary", "") or entry.get("description", "")
         url = entry.get("link", "")
 
         try:
