@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import google.generativeai as genai
-import os
+import os, re
 import feedparser
 from flask_cors import CORS
 
@@ -10,54 +10,69 @@ CORS(app)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash-preview-04-17")
 
-@app.route("/")
-def index():
-    return jsonify({"message": "RSS Summarizer API is running."})
+# simple keyword bucket for talent‑movement tagging
+MOVE_PAT = re.compile(r"(layoff|hiring|acqui|merge|ipo|fundrais|restructur|expan|headcount)",
+                      re.IGNORECASE)
+
+def ai_summary(title, content):
+    prompt = (
+        "You are an expert recruiting‑market analyst. "
+        "Write ONE clear sentence summarizing this article, "
+        "focusing on hiring, layoffs, acquisitions, funding, or notable org changes.\n\n"
+        f"TITLE: {title}\n\nCONTENT: {content[:2000]}"
+    )
+    try:
+        return model.generate_content(prompt).text.strip()
+    except Exception as e:
+        return f"[Gemini error: {e}]"
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
-    try:
-        data = request.json
-        feed_urls = data.get("feedUrls", [])
+    data = request.json
+    feeds = data.get("feedUrls", [])
 
-        if not feed_urls or not isinstance(feed_urls, list):
-            return jsonify({"error": "feedUrls must be a list of URLs"}), 400
+    if not isinstance(feeds, list) or not feeds:
+        return jsonify({"error": "feedUrls should be a non‑empty list"}), 400
 
-        result = []
-        for url in feed_urls[:10]:
-            print(f"⏳ Parsing feed: {url}")
-            feed = feedparser.parse(url)
-            if not feed.entries:
-                continue
+    all_sentences = []
+    out = []
 
-            feed_summaries = []
-            for entry in feed.entries[:5]:
-                title = entry.get("title", "")
-                content = entry.get("summary", "") or entry.get("description", "")
-                link = entry.get("link", "")
+    for url in feeds[:10]:
+        parsed = feedparser.parse(url)
+        if not parsed.entries:
+            continue
 
-                try:
-                    prompt = f"Summarize the following news article clearly and concisely:\n\nTitle: {title}\n\n{content}"
-                    response = model.generate_content(prompt)
-                    summary = response.text.strip()
-                except Exception as e:
-                    summary = f"[Gemini error: {str(e)}]"
+        feed_block = {"source": parsed.feed.get("title", url), "articles": []}
 
-                feed_summaries.append({
-                    "title": title,
-                    "summary": summary,
-                    "link": link
-                })
+        for entry in parsed.entries[:5]:
+            title = entry.get("title", "")
+            body = entry.get("summary", "") or entry.get("description", "")
+            link = entry.get("link", "")
 
-            result.append({
-                "source": feed.feed.get("title", url),
-                "summaries": feed_summaries
+            summary = ai_summary(title, body)
+            flag = bool(MOVE_PAT.search(title + " " + body))
+
+            feed_block["articles"].append({
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "movement": flag
             })
+            all_sentences.append(summary)
 
-        return jsonify({ "feeds": result })
-    except Exception as e:
-        print(f"❌ Uncaught error in summarize(): {e}")
-        return jsonify({"error": str(e)}), 500
+        out.append(feed_block)
+
+    # big‑picture digest
+    digest_prompt = (
+        "You are a recruiting‑market analyst. "
+        "Given these one‑sentence article summaries, produce:\n"
+        "1) A 2‑sentence high‑level overview.\n"
+        "2) Five bullet points of the most relevant talent‑movement stories.\n\n"
+        + "\n".join(all_sentences[:40])
+    )
+    digest_resp = model.generate_content(digest_prompt).text.strip()
+
+    return jsonify({"digest": digest_resp, "feeds": out})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
