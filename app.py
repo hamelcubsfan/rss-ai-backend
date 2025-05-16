@@ -10,16 +10,8 @@ CORS(app)
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash-preview-04-17")
 
-# Default feeds
-DEFAULT_FEEDS = [
-    "https://www.techmeme.com/feed.xml",
-    "https://techcrunch.com/feed/",
-    "https://www.geekwire.com/feed/"
-]
-
 # simple keyword bucket for talent‑movement tagging
-MOVE_PAT = re.compile(r"(layoff|hiring|acqui|merge|ipo|fundrais|restructur|expan|headcount)",
-                      re.IGNORECASE)
+MOVE_PAT = re.compile(r"(layoff|hiring|acqui|merge|ipo|fundrais|restructur|expan|headcount)", re.IGNORECASE)
 
 def ai_summary(title, content):
     prompt = (
@@ -35,11 +27,11 @@ def ai_summary(title, content):
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
-    data = request.json or {}
+    data = request.json
     feeds = data.get("feedUrls", [])
-    # If not a non-empty list, use default feeds
+
     if not isinstance(feeds, list) or not feeds:
-        feeds = DEFAULT_FEEDS.copy()
+        return jsonify({"error": "feedUrls should be a non‑empty list"}), 400
 
     all_sentences = []
     out = []
