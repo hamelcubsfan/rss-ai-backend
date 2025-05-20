@@ -8,7 +8,7 @@ app = Flask(__name__)
 CORS(app)
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("models/gemini-2.5-flash-preview-04-17")
+model = genai.GenerativeModel("models/gemini-2.5-flash-preview-05-20")
 
 # simple keyword bucket for talent‑movement tagging
 MOVE_PAT = re.compile(r"(layoff|hiring|acqui|merge|ipo|fundrais|restructur|expan|headcount)", re.IGNORECASE)
