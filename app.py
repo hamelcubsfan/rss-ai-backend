@@ -4,32 +4,30 @@ import re
 import json
 import logging
 import html as html_lib
-from typing import List, Dict
+from typing import List
 
 from flask import Flask, request, jsonify
-import genai
+
+# Google GenAI SDK imports
+from google import genai
+from google.genai import types
 
 # ---- Configuration ----
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-GENAI_API_KEY = os.environ.get("GENAI_API_KEY", None)
-GENAI_MODEL = os.environ.get("GENAI_MODEL", "models/gemini-2.5-pro")
+# prefer GEMINI_API_KEY name used in official examples, but fall back to GENAI_API_KEY if present
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GENAI_API_KEY")
+# default model (adjust if you prefer another)
+GENAI_MODEL = os.environ.get("GENAI_MODEL", "gemini-2.5-pro")
 
 logging.basicConfig(level=LOG_LEVEL)
 log = logging.getLogger("rss-ai-backend")
 
-if not GENAI_API_KEY:
-    log.warning("GENAI_API_KEY not set. Set this in your environment for the model to work.")
+# initialize client; if API key provided pass it, otherwise client will try environment
+if API_KEY:
+    client = genai.Client(api_key=API_KEY)
 else:
-    genai.configure(api_key=GENAI_API_KEY)
-
-# Generation configs: deterministic for article summaries to reduce hallucination,
-# slightly larger budget for digest generation.
-generation_cfg_article = genai.GenerationConfig(temperature=0.0, max_output_tokens=120)
-generation_cfg_digest = genai.GenerationConfig(temperature=0.0, max_output_tokens=350)
-
-# Models (two instances share same model name but different generation configs)
-model_article = genai.GenerativeModel(GENAI_MODEL, generation_config=generation_cfg_article)
-model_digest = genai.GenerativeModel(GENAI_MODEL, generation_config=generation_cfg_digest)
+    # If no API key provided, client will attempt to pick from env (GEMINI_API_KEY) or other auth flows
+    client = genai.Client()
 
 app = Flask(__name__)
 
@@ -39,7 +37,7 @@ WHITESPACE_RE = re.compile(r"\s+")
 
 
 def clean_text(html: str) -> str:
-    """Strip HTML tags, unescape entities, and collapse whitespace."""
+    """Strip HTML tags, unescape HTML entities, and collapse whitespace."""
     if not html:
         return ""
     text = TAG_RE.sub(" ", html)
@@ -49,47 +47,44 @@ def clean_text(html: str) -> str:
 
 
 def first_sentence(text: str) -> str:
-    """Return the first sentence-like fragment. Keep it short."""
+    """Return the first sentence-like fragment, short and tidy."""
     if not text:
         return ""
-    # Split on period, question mark, exclamation, or newline
     parts = re.split(r"[.?!\n]", text)
     first = parts[0].strip()
-    # If too short, fallback to a trimmed substring
     if len(first) < 10 and len(text) > 0:
         first = text.strip().split("\n")[0][:200].strip()
     if not first:
         return ""
-    # Ensure it ends with a period for UI consistency
     return first.rstrip() + "."
 
 
-def safe_extract_text_from_response(resp) -> str:
+def call_generate(model_name: str, prompt: str, max_tokens: int = 120, temperature: float = 0.0) -> str:
     """
-    Extract the generated text from the SDK response in a robust way.
-    The SDK may return different shapes; handle common ones.
+    Wrapper around google-genai sync generate_content.
+    Returns the text portion of the model response, or empty string on error.
     """
-    if resp is None:
-        return ""
-    # try common attributes in order
-    if hasattr(resp, "text"):
-        return getattr(resp, "text") or ""
-    if isinstance(resp, dict):
-        # Attempt to navigate possible dict shape
-        # e.g., {"generations": [{"text": "..."}, ...]}
-        gens = resp.get("generations") or resp.get("choices") or []
-        if gens and isinstance(gens, list) and "text" in gens[0]:
-            return gens[0]["text"] or ""
-        # fallback to 'text' key
-        return resp.get("text", "") or ""
-    # Last-resort string conversion
-    return str(resp)
+    try:
+        cfg = types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=cfg,
+        )
+        # response typically has .text attribute
+        return getattr(resp, "text", "") or ""
+    except Exception as e:
+        log.exception("generate_content call failed")
+        return f"[model error: {e}]"
 
 
-# ---- AI functions ----
+# ---- AI functions and prompts ----
 ARTICLE_PROMPT_TEMPLATE = (
     "You are a recruiting-market analyst. ONLY use facts contained in the ARTICLE_CONTENT block below. "
-    "Do not invent details, dates, numbers, or persons. If the article contains no hiring, layoffs, funding, "
+    "Do not invent details, dates, numbers, or people. If the article contains no hiring, layoffs, funding, "
     "acquisitions, leadership change, or org-change signals, reply exactly: No relevant recruiting signals found.\n\n"
     "TITLE: {title}\n\n"
     "ARTICLE_CONTENT: {content}\n\n"
@@ -98,13 +93,12 @@ ARTICLE_PROMPT_TEMPLATE = (
     "Do not add context or other facts not present in ARTICLE_CONTENT."
 )
 
-
 DIGEST_PROMPT_TEMPLATE = (
     "You are a recruiting-market analyst. ONLY use the one-sentence summaries provided below. "
     "Do not invent facts. From these sentences, produce:\n"
     "1) One 1-sentence high-level trend summary.\n"
     "2) A short bulleted list (up to 5 bullets) of the most relevant recruiting signals, "
-    "each bullet 1-2 short phrases (e.g., 'Company X hiring surge', 'Acquisition Y prompts restructuring').\n\n"
+    "each bullet 1-2 short phrases (for example: 'Company X hiring surge', 'Acquisition Y prompts restructuring').\n\n"
     "If the provided summaries are all 'No relevant recruiting signals found' or empty, reply: No recruiting signals across these articles.\n\n"
     "SUMMARIES:\n{summaries}\n\n"
     "OUTPUT:"
@@ -113,40 +107,26 @@ DIGEST_PROMPT_TEMPLATE = (
 
 def ai_summary(title: str, content: str) -> str:
     """Generate a short, factual one-sentence summary focused on recruiting signals."""
-    content_clean = clean_text(content)
-    # keep a reasonable chunk of the article but not infinite
-    content_chunk = content_clean[:6000]  # adjust as needed for token budget
+    content_clean = clean_text(content or "")
+    content_chunk = content_clean[:6000]
     prompt = ARTICLE_PROMPT_TEMPLATE.format(title=title or "", content=content_chunk)
-    try:
-        resp = model_article.generate_content(prompt)
-        text = safe_extract_text_from_response(resp).strip()
-        text = text.replace("\n", " ").strip()
-        if not text:
-            return "No relevant recruiting signals found."
-        # Normalize and return only the first sentence to avoid long outputs
-        return first_sentence(text)
-    except Exception as e:
-        log.exception("Error calling model_article.generate_content")
-        return f"[model error: {e}]"
+    text = call_generate(GENAI_MODEL, prompt, max_tokens=120, temperature=0.0).strip()
+    text = text.replace("\n", " ").strip()
+    if not text:
+        return "No relevant recruiting signals found."
+    return first_sentence(text)
 
 
 def ai_digest(summaries: List[str]) -> str:
-    """Aggregate short summaries into a compact digest with strict constraints."""
-    # filter and normalize summaries
+    """Aggregate one-sentence summaries into a compact digest with strict constraints."""
     cleaned = [s.strip() for s in summaries if s and not s.lower().startswith("[model error:")]
     if not cleaned:
         return "No recruiting signals across these articles."
-    # If many, limit to first 50 to keep digest focused
     cleaned = cleaned[:50]
     summaries_block = "\n".join(f"- {s}" for s in cleaned)
     prompt = DIGEST_PROMPT_TEMPLATE.format(summaries=summaries_block)
-    try:
-        resp = model_digest.generate_content(prompt)
-        text = safe_extract_text_from_response(resp).strip()
-        return text
-    except Exception as e:
-        log.exception("Error calling model_digest.generate_content")
-        return f"[model error: {e}]"
+    text = call_generate(GENAI_MODEL, prompt, max_tokens=350, temperature=0.0).strip()
+    return text
 
 
 # ---- Flask endpoints ----
@@ -157,15 +137,10 @@ def health():
 
 @app.route("/summarize_article", methods=["POST"])
 def summarize_article():
-    """
-    Expect JSON: { "title": "...", "content": "..." }
-    Returns: { "summary": "..." }
-    """
     payload = request.get_json(force=True, silent=True) or {}
     title = payload.get("title", "")
     content = payload.get("content", "")
     if not content and "url" in payload:
-        # optional: if frontend sends url only, respond with an error so frontend can fetch content
         return jsonify({"error": "No content provided. Provide article content or call fetch endpoint first."}), 400
     summary = ai_summary(title, content)
     return jsonify({"summary": summary})
@@ -173,13 +148,6 @@ def summarize_article():
 
 @app.route("/summarize_batch", methods=["POST"])
 def summarize_batch():
-    """
-    Expect JSON: { "articles": [ {"title":"", "content":"", "url":""}, ... ] }
-    Returns: {
-       "summaries": [{"title":"", "summary":"", "url":""}, ...],
-       "digest": "..."
-    }
-    """
     payload = request.get_json(force=True, silent=True) or {}
     articles = payload.get("articles") or []
     if not isinstance(articles, list) or not articles:
@@ -195,32 +163,21 @@ def summarize_batch():
         results.append({"title": title, "summary": summary, "url": url})
         all_summaries.append(summary)
 
-    # create digest from the one-sentence summaries
     digest = ai_digest(all_summaries)
-
     return jsonify({"summaries": results, "digest": digest})
 
 
-# Light-weight endpoint to test prompt behavior without article content
 @app.route("/debug_prompt", methods=["POST"])
 def debug_prompt():
     payload = request.get_json(force=True, silent=True) or {}
     prompt = payload.get("prompt", "")
     which = payload.get("which", "article")
     if which == "digest":
-        try:
-            resp = model_digest.generate_content(prompt)
-            return jsonify({"raw": safe_extract_text_from_response(resp)})
-        except Exception as e:
-            log.exception("Error debug digest")
-            return jsonify({"error": str(e)}), 500
+        text = call_generate(GENAI_MODEL, prompt, max_tokens=350, temperature=0.0)
+        return jsonify({"raw": text})
     else:
-        try:
-            resp = model_article.generate_content(prompt)
-            return jsonify({"raw": safe_extract_text_from_response(resp)})
-        except Exception as e:
-            log.exception("Error debug article")
-            return jsonify({"error": str(e)}), 500
+        text = call_generate(GENAI_MODEL, prompt, max_tokens=120, temperature=0.0)
+        return jsonify({"raw": text})
 
 
 if __name__ == "__main__":
