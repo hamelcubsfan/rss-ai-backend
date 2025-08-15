@@ -1,53 +1,75 @@
 # app.py
 import os
 import re
-import json
 import logging
 import html as html_lib
 from typing import List
+from urllib.parse import urlparse
 
-from flask import Flask, request, jsonify
+import requests
+import feedparser
+from bs4 import BeautifulSoup
 
-# Google GenAI SDK imports
+from flask import Flask, request, jsonify, make_response
+from flask_cors import CORS
+
+# google-genai imports
 from google import genai
 from google.genai import types
 
-# ---- Configuration ----
+# ---- config ----
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-# prefer GEMINI_API_KEY name used in official examples, but fall back to GENAI_API_KEY if present
 API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GENAI_API_KEY")
-# default model (adjust if you prefer another)
 GENAI_MODEL = os.environ.get("GENAI_MODEL", "gemini-2.5-pro")
+
+MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", 40))  # guard for cost/perf
 
 logging.basicConfig(level=LOG_LEVEL)
 log = logging.getLogger("rss-ai-backend")
 
-# initialize client; if API key provided pass it, otherwise client will try environment
+# client init
 if API_KEY:
     client = genai.Client(api_key=API_KEY)
 else:
-    # If no API key provided, client will attempt to pick from env (GEMINI_API_KEY) or other auth flows
-    client = genai.Client()
+    client = genai.Client()  # will use env-based auth if available
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ---- Helpers ----
+# ---- helpers ----
 TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
 
 
-def clean_text(html: str) -> str:
-    """Strip HTML tags, unescape HTML entities, and collapse whitespace."""
+def clean_text_from_html(html: str) -> str:
+    """Strip tags, unescape, collapse whitespace and trim."""
     if not html:
         return ""
-    text = TAG_RE.sub(" ", html)
+    # Use BeautifulSoup for nicer extraction if the input is complex
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator=" ")
+    except Exception:
+        text = TAG_RE.sub(" ", html)
     text = html_lib.unescape(text)
     text = WHITESPACE_RE.sub(" ", text)
     return text.strip()
 
 
+def fetch_article_text(url: str) -> str:
+    """Try to fetch page and extract main text. Keep it defensive."""
+    try:
+        headers = {"User-Agent": "rss-ai-backend/1.0"}
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code != 200:
+            return ""
+        return clean_text_from_html(r.text)[:10000]
+    except Exception:
+        return ""
+
+
 def first_sentence(text: str) -> str:
-    """Return the first sentence-like fragment, short and tidy."""
+    """Return a short first-sentence fragment."""
     if not text:
         return ""
     parts = re.split(r"[.?!\n]", text)
@@ -60,37 +82,25 @@ def first_sentence(text: str) -> str:
 
 
 def call_generate(model_name: str, prompt: str, max_tokens: int = 120, temperature: float = 0.0) -> str:
-    """
-    Wrapper around google-genai sync generate_content.
-    Returns the text portion of the model response, or empty string on error.
-    """
+    """Wrapper to call google-genai and return text or an error string."""
     try:
-        cfg = types.GenerateContentConfig(
-            max_output_tokens=max_tokens,
-            temperature=temperature,
-        )
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=cfg,
-        )
-        # response typically has .text attribute
+        cfg = types.GenerateContentConfig(max_output_tokens=max_tokens, temperature=temperature)
+        resp = client.models.generate_content(model=model_name, contents=prompt, config=cfg)
         return getattr(resp, "text", "") or ""
     except Exception as e:
-        log.exception("generate_content call failed")
+        log.exception("genai.generate_content failure")
         return f"[model error: {e}]"
 
 
-# ---- AI functions and prompts ----
+# ---- prompts ----
 ARTICLE_PROMPT_TEMPLATE = (
     "You are a recruiting-market analyst. ONLY use facts contained in the ARTICLE_CONTENT block below. "
     "Do not invent details, dates, numbers, or people. If the article contains no hiring, layoffs, funding, "
     "acquisitions, leadership change, or org-change signals, reply exactly: No relevant recruiting signals found.\n\n"
     "TITLE: {title}\n\n"
     "ARTICLE_CONTENT: {content}\n\n"
-    "INSTRUCTIONS: Produce one concise sentence focused on recruiting, hiring, leadership, funding, "
-    "or organizational signals present in the ARTICLE_CONTENT. Keep the sentence short and factual. "
-    "Do not add context or other facts not present in ARTICLE_CONTENT."
+    "INSTRUCTIONS: Produce one concise sentence focused on recruiting signals present in ARTICLE_CONTENT. "
+    "Keep it short and factual. Do not add context or other facts not present in ARTICLE_CONTENT."
 )
 
 DIGEST_PROMPT_TEMPLATE = (
@@ -105,11 +115,11 @@ DIGEST_PROMPT_TEMPLATE = (
 )
 
 
+# ---- ai helpers ----
 def ai_summary(title: str, content: str) -> str:
-    """Generate a short, factual one-sentence summary focused on recruiting signals."""
-    content_clean = clean_text(content or "")
-    content_chunk = content_clean[:6000]
-    prompt = ARTICLE_PROMPT_TEMPLATE.format(title=title or "", content=content_chunk)
+    content_clean = clean_text_from_html(content or "")
+    chunk = content_clean[:6000]
+    prompt = ARTICLE_PROMPT_TEMPLATE.format(title=title or "", content=chunk)
     text = call_generate(GENAI_MODEL, prompt, max_tokens=120, temperature=0.0).strip()
     text = text.replace("\n", " ").strip()
     if not text:
@@ -118,7 +128,6 @@ def ai_summary(title: str, content: str) -> str:
 
 
 def ai_digest(summaries: List[str]) -> str:
-    """Aggregate one-sentence summaries into a compact digest with strict constraints."""
     cleaned = [s.strip() for s in summaries if s and not s.lower().startswith("[model error:")]
     if not cleaned:
         return "No recruiting signals across these articles."
@@ -129,7 +138,18 @@ def ai_digest(summaries: List[str]) -> str:
     return text
 
 
-# ---- Flask endpoints ----
+# ---- endpoints ----
+@app.errorhandler(404)
+def handle_404(e):
+    return make_response(jsonify({"error": "not found", "path": request.path}), 404)
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    log.exception("Unhandled exception")
+    return make_response(jsonify({"error": "internal_server_error", "message": str(e)}), 500)
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -140,8 +160,11 @@ def summarize_article():
     payload = request.get_json(force=True, silent=True) or {}
     title = payload.get("title", "")
     content = payload.get("content", "")
-    if not content and "url" in payload:
-        return jsonify({"error": "No content provided. Provide article content or call fetch endpoint first."}), 400
+    url = payload.get("url", "")
+    if not content and url:
+        content = fetch_article_text(url)
+    if not content:
+        return jsonify({"summary": "No relevant recruiting signals found."})
     summary = ai_summary(title, content)
     return jsonify({"summary": summary})
 
@@ -151,14 +174,16 @@ def summarize_batch():
     payload = request.get_json(force=True, silent=True) or {}
     articles = payload.get("articles") or []
     if not isinstance(articles, list) or not articles:
-        return jsonify({"error": "Provide a non-empty articles list"}), 400
+        return make_response(jsonify({"error": "Provide a non-empty articles list"}), 400)
 
     results = []
     all_summaries = []
-    for art in articles:
+    for art in articles[:MAX_ARTICLES]:
         title = art.get("title") or art.get("headline") or ""
         content = art.get("content") or art.get("summary") or ""
         url = art.get("url") or ""
+        if not content and url:
+            content = fetch_article_text(url)
         summary = ai_summary(title, content)
         results.append({"title": title, "summary": summary, "url": url})
         all_summaries.append(summary)
@@ -167,17 +192,66 @@ def summarize_batch():
     return jsonify({"summaries": results, "digest": digest})
 
 
-@app.route("/debug_prompt", methods=["POST"])
-def debug_prompt():
+@app.route("/summarize", methods=["POST"])
+def summarize_feeds():
+    """
+    New helper endpoint expected by the extension.
+    Accepts JSON:
+    {
+      "feedUrls": ["https://..."],
+      "articlePrompt": "...",  # optional, not used now
+      "digestPrompt": "..."    # optional
+    }
+    Returns JSON with summaries and digest.
+    """
     payload = request.get_json(force=True, silent=True) or {}
-    prompt = payload.get("prompt", "")
-    which = payload.get("which", "article")
-    if which == "digest":
-        text = call_generate(GENAI_MODEL, prompt, max_tokens=350, temperature=0.0)
-        return jsonify({"raw": text})
-    else:
-        text = call_generate(GENAI_MODEL, prompt, max_tokens=120, temperature=0.0)
-        return jsonify({"raw": text})
+    feed_urls = payload.get("feedUrls") or []
+    if not isinstance(feed_urls, list) or not feed_urls:
+        return make_response(jsonify({"error": "Provide feedUrls list"}), 400)
+
+    articles = []
+    seen = set()
+    for feed_url in feed_urls:
+        try:
+            parsed = feedparser.parse(feed_url)
+        except Exception:
+            parsed = None
+        if not parsed or not getattr(parsed, "entries", None):
+            continue
+        for entry in parsed.entries:
+            if len(articles) >= MAX_ARTICLES:
+                break
+            title = entry.get("title", "") or entry.get("headline", "")
+            url = entry.get("link", "") or entry.get("id", "")
+            # dedupe by (hostname + path) when possible
+            key = (url or title).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            # extract content preference: content > summary > fetch from url
+            content = ""
+            if "content" in entry and isinstance(entry.content, list) and entry.content:
+                content = entry.content[0].value
+            elif entry.get("summary"):
+                content = entry.get("summary")
+            elif url:
+                content = fetch_article_text(url)
+            # keep it short on server side
+            articles.append({"title": title, "content": content, "url": url})
+
+    if not articles:
+        return jsonify({"summaries": [], "digest": "No articles found from provided feeds."})
+
+    # summarize and build digest
+    summaries = []
+    results = []
+    for art in articles:
+        s = ai_summary(art.get("title"), art.get("content"))
+        results.append({"title": art.get("title"), "summary": s, "url": art.get("url")})
+        summaries.append(s)
+
+    digest = ai_digest(summaries)
+    return jsonify({"summaries": results, "digest": digest})
 
 
 if __name__ == "__main__":
