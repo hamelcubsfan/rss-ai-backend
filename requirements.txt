@@ -1,6 +1,4 @@
-Flask==2.3.3
-flask-cors==3.0.10
-feedparser==6.0.10
-requests==2.32.0
-beautifulsoup4==4.12.2
-google-genai==0.3.0
+Flask
+flask-cors
+google-generativeai
+feedparser
