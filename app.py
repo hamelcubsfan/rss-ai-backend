@@ -1,16 +1,17 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import google.generativeai as genai
 import os, re
 import feedparser
-from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)
+
+# Allow requests from your Chrome extension
+CORS(app, origins=["chrome-extension://cifmigbdeenpbpllpammmkjfddllbenk"])
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash")
 
-# simple keyword bucket for talent‑movement tagging
 MOVE_PAT = re.compile(r"(layoff|hiring|acqui|merge|ipo|fundrais|restructur|expan|headcount)", re.IGNORECASE)
 
 def ai_summary(title, content, article_prompt=None):
@@ -30,6 +31,7 @@ def ai_summary(title, content, article_prompt=None):
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
+    print("Received POST to /summarize")
     data = request.json
     feeds = data.get("feedUrls", [])
     article_prompt = data.get("articlePrompt")
@@ -78,6 +80,7 @@ def summarize():
             + "\n".join(all_sentences[:40])
         )
     digest_resp = model.generate_content(prompt).text.strip()
+    print("Finished processing /summarize")
 
     return jsonify({"digest": digest_resp, "feeds": out})
 
