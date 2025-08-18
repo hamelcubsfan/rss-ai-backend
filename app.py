@@ -5,7 +5,7 @@ import os, re
 import feedparser
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True, send_wildcard=True)
+CORS(app)  # <-- This is the most permissive and safe for debugging!
 
 # Catch-all logger for every request
 @app.before_request
