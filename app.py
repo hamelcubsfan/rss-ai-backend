@@ -5,9 +5,7 @@ import os, re
 import feedparser
 
 app = Flask(__name__)
-
-# Allow requests from your Chrome extension
-CORS(app, origins=["chrome-extension://cifmigbdeenpbpllpammmkjfddllbenk"])
+CORS(app)  # This allows all origins and all methods for debugging
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash")
@@ -38,6 +36,7 @@ def summarize():
     digest_prompt = data.get("digestPrompt")
 
     if not isinstance(feeds, list) or not feeds:
+        print("feedUrls missing or not a list")
         return jsonify({"error": "feedUrls should be a non‑empty list"}), 400
 
     all_sentences = []
