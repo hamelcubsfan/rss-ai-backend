@@ -5,7 +5,12 @@ import os, re
 import feedparser
 
 app = Flask(__name__)
-CORS(app)  # This allows all origins and all methods for debugging
+CORS(app)
+
+# Catch-all logger for every request
+@app.before_request
+def log_request():
+    print(f"==> LOG: {request.method} {request.path} | headers: {dict(request.headers)}")
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash")
@@ -67,7 +72,6 @@ def summarize():
 
         out.append(feed_block)
 
-    # big‑picture digest
     if digest_prompt:
         prompt = digest_prompt + "\n" + "\n".join(all_sentences[:40])
     else:
